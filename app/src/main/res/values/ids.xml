@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="start_scan_button" type="id" />
+    <item name="start_advertise_button" type="id" />
+    <item name="device_list_view" type="id" />
+</resources>
