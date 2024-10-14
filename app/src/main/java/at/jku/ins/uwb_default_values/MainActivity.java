@@ -45,6 +45,7 @@ import androidx.core.uwb.rxjava3.UwbManagerRx;
 
 import com.google.common.primitives.Shorts;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.UUID;
@@ -57,8 +58,8 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int REQUEST_PERMISSIONS = 1;
     private static final int REQUEST_ENABLE_BT = 2;
-    private static final long SCAN_PERIOD = 10000; // Scanning time in milliseconds
-    private static final UUID SERVICE_UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb");
+    private static final long SCAN_PERIOD = 10000;
+    private static final UUID UWB_SERVICE_UUID = UUID.fromString("0000181C-0000-1000-8000-00805f9b34fb");
 
     private Button stopRangingButton;
     private Button communicateButton;
@@ -72,9 +73,14 @@ public class MainActivity extends AppCompatActivity {
     private AtomicReference<UwbClientSessionScope> currentUwbSessionScope;
     private Switch isControllerSwitch;
     private ListView deviceListView;
+
+    private Button toggleAdvertiseButton;
+    private boolean isAdvertising = false;
     private ArrayAdapter<String> deviceListAdapter;
     private ArrayList<BluetoothDevice> bluetoothDevices;
-
+    private boolean isController;
+    private UwbAddress localUwbAddress;
+    private UwbComplexChannel localUwbChannel;
     private BluetoothAdapter bluetoothAdapter;
     private BluetoothLeScanner bluetoothLeScanner;
     private BluetoothLeAdvertiser bluetoothLeAdvertiser;
@@ -88,7 +94,6 @@ public class MainActivity extends AppCompatActivity {
 
         requestPermissions();
 
-        // Initialize Bluetooth
         BluetoothManager bluetoothManager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         bluetoothAdapter = bluetoothManager.getAdapter();
         if (bluetoothAdapter != null) {
@@ -97,21 +102,23 @@ public class MainActivity extends AppCompatActivity {
         }
         handler = new Handler();
 
-        // Initialize UWB components
         uwbManager = UwbManager.createInstance(this);
         rangingResultObservable = new AtomicReference<>(null);
         currentUwbSessionScope = new AtomicReference<>(null);
 
-        // Initialize UI components
         initializeUIComponents();
 
-        // Set up BLE device list
         bluetoothDevices = new ArrayList<>();
         deviceListAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
         deviceListView.setAdapter(deviceListAdapter);
 
-        // Set up button click listeners
+        toggleAdvertiseButton = findViewById(R.id.start_advertise_button);
+        toggleAdvertiseButton.setOnClickListener(v -> toggleBleAdvertising());
+
         setupButtonListeners();
+
+        isController = isControllerSwitch.isChecked();
+       // refreshUwbSession();
 
         new Thread(this::refreshUwbSession).start();
     }
@@ -167,13 +174,22 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void refreshUwbSession() {
-        boolean isController = isControllerSwitch.isChecked();
+        isController = isControllerSwitch.isChecked();
         if (isController) {
-            currentUwbSessionScope.set(UwbManagerRx.controllerSessionScopeSingle(uwbManager).blockingGet());
+            UwbControllerSessionScope controllerScope = UwbManagerRx.controllerSessionScopeSingle(uwbManager).blockingGet();
+            currentUwbSessionScope.set(controllerScope);
+            localUwbAddress = controllerScope.getLocalAddress();
+            localUwbChannel = controllerScope.getUwbComplexChannel();
         } else {
-            currentUwbSessionScope.set(UwbManagerRx.controleeSessionScopeSingle(uwbManager).blockingGet());
+            UwbControleeSessionScope controleeScope = UwbManagerRx.controleeSessionScopeSingle(uwbManager).blockingGet();
+            currentUwbSessionScope.set(controleeScope);
+            localUwbAddress = controleeScope.getLocalAddress();
+            // Note: Controlees don't have channel information initially
         }
-        runOnUiThread(() -> displayUwbValues(null));
+        runOnUiThread(() -> {
+            displayUwbValues(null);
+          //  updateBleAdvertising();
+        });
     }
 
     private void displayUwbValues(android.view.View view) {
@@ -224,7 +240,7 @@ public class MainActivity extends AppCompatActivity {
                     Collections.singletonList(new UwbDevice(partnerAddress)),
                     RangingParameters.RANGING_UPDATE_RATE_AUTOMATIC);
 
-            stopRanging();  // Stop any existing ranging before starting a new one
+            stopRanging();
 
             rangingResultObservable.set(UwbClientSessionScopeRx.rangingResultsObservable(currentUwbSessionScope.get(), partnerParameters)
                     .subscribe(rangingResult -> {
@@ -258,6 +274,64 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void startUwbCommunication(UwbAddress partnerAddress, UwbComplexChannel channelToUse) {
+        runOnUiThread(() -> {
+            Toast.makeText(this, "Starting UWB communication with device: " + partnerAddress, Toast.LENGTH_SHORT).show();
+        });
+
+        try {
+            RangingParameters partnerParameters = new RangingParameters(
+                    RangingParameters.CONFIG_MULTICAST_DS_TWR,
+                    12345, // session ID
+                    0, // sub-session ID
+                    new byte[]{0, 0, 0, 0, 0, 0, 0, 0}, // session key (optional)
+                    null, // sub-session key (optional)
+                    channelToUse,
+                    Collections.singletonList(new UwbDevice(partnerAddress)),
+                    RangingParameters.RANGING_UPDATE_RATE_AUTOMATIC
+            );
+
+            stopRanging(); // Stop any existing ranging
+
+            rangingResultObservable.set(UwbClientSessionScopeRx.rangingResultsObservable(currentUwbSessionScope.get(), partnerParameters)
+                    .subscribe(
+                            rangingResult -> {
+                                if (rangingResult instanceof RangingResult.RangingResultPosition) {
+                                    RangingResult.RangingResultPosition rangingResultPosition = (RangingResult.RangingResultPosition) rangingResult;
+                                    updateDisplay(rangingResultPosition);
+                                } else {
+                                    System.out.println("CONNECTION LOST");
+                                    runOnUiThread(this::resetDisplays);
+                                }
+                            },
+                            error -> {
+                                System.err.println("Error in ranging: " + error.getMessage());
+                                error.printStackTrace();
+                                runOnUiThread(this::resetDisplays);
+                            },
+                            () -> {
+                                System.out.println("Completed the observing of RangingResults");
+                                runOnUiThread(() -> {
+                                    stopRangingButton.setEnabled(false);
+                                    communicateButton.setEnabled(true);
+                                    resetDisplays();
+                                });
+                            }
+                    ));
+
+            runOnUiThread(() -> {
+                stopRangingButton.setEnabled(true);
+                communicateButton.setEnabled(false);
+            });
+
+        } catch (Exception e) {
+            runOnUiThread(() -> {
+                Toast.makeText(this, "Error starting UWB communication: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            });
+            e.printStackTrace();
+        }
+    }
+
     private void stopRanging() {
         if (rangingResultObservable.get() != null) {
             rangingResultObservable.get().dispose();
@@ -268,6 +342,17 @@ public class MainActivity extends AppCompatActivity {
             communicateButton.setEnabled(true);
             resetDisplays();
         });
+    }
+
+    private void stopBleAdvertising() {
+        if (bluetoothLeAdvertiser != null) {
+            bluetoothLeAdvertiser.stopAdvertising(advertiseCallback);
+            runOnUiThread(() -> {
+                isAdvertising = false;
+                toggleAdvertiseButton.setText("Start Advertising");
+                Toast.makeText(MainActivity.this, "Advertising stopped", Toast.LENGTH_SHORT).show();
+            });
+        }
     }
 
     private void updateDisplay(RangingResult.RangingResultPosition rangingResultPosition) {
@@ -317,38 +402,129 @@ public class MainActivity extends AppCompatActivity {
             BluetoothDevice device = result.getDevice();
             if (!bluetoothDevices.contains(device)) {
                 bluetoothDevices.add(device);
-                String deviceInfo = device.getName() != null ? device.getName() : device.getAddress();
+                String deviceName = device.getName() != null ? device.getName() : device.getAddress();
+
+                StringBuilder deviceInfo = new StringBuilder(deviceName);
+
+                byte[] uwbServiceData = result.getScanRecord().getServiceData(new ParcelUuid(UWB_SERVICE_UUID));
+                if (uwbServiceData != null && uwbServiceData.length >= 7) {
+                    ByteBuffer buffer = ByteBuffer.wrap(uwbServiceData);
+
+                    short uwbAddress = buffer.getShort(0);
+                    int channel = buffer.get(2) & 0xFF;
+                    int preambleIndex = buffer.get(3) & 0xFF;
+                    short sessionId = buffer.getShort(4);
+                    boolean deviceIsController = buffer.get(6) == 1;
+
+                    deviceInfo.append("\nUWB Address: ").append(uwbAddress)
+                            .append("\nChannel: ").append(channel)
+                            .append("\nPreamble Index: ").append(preambleIndex)
+                            .append("\nSession ID: ").append(sessionId)
+                            .append("\nIs Controller: ").append(deviceIsController);
+
+                    // Check if the discovered device is compatible for UWB communication
+                    if (isController != deviceIsController) {
+                        UwbAddress partnerAddress = new UwbAddress(Shorts.toByteArray(uwbAddress));
+                        UwbComplexChannel channelToUse;
+
+                        if (isController) {
+                            // If we're the controller, use our own channel and preamble index
+                            channelToUse = localUwbChannel;
+                        } else {
+                            // If we're the controlee, use the discovered controller's channel and preamble index
+                            channelToUse = new UwbComplexChannel(channel, preambleIndex);
+                        }
+
+                        startUwbCommunication(partnerAddress, channelToUse);
+                    }
+                } else {
+                    deviceInfo.append("\nNo UWB info available");
+                }
+
+                final String finalDeviceInfo = deviceInfo.toString();
                 runOnUiThread(() -> {
-                    deviceListAdapter.add(deviceInfo);
+                    deviceListAdapter.add(finalDeviceInfo);
                     deviceListAdapter.notifyDataSetChanged();
                 });
             }
         }
     };
+
+    private byte[] getUwbInfoBytes() {
+        ByteBuffer buffer = ByteBuffer.allocate(7); // 2 bytes for address, 1 for channel, 1 for preamble index, 2 for session ID, 1 for isController
+
+        UwbClientSessionScope sessionScope = currentUwbSessionScope.get();
+        if (sessionScope == null) {
+            return buffer.array(); // Return empty array if no session
+        }
+
+        buffer.put(sessionScope.getLocalAddress().getAddress());
+
+        if (sessionScope instanceof UwbControllerSessionScope) {
+            UwbControllerSessionScope controllerScope = (UwbControllerSessionScope) sessionScope;
+            UwbComplexChannel channel = controllerScope.getUwbComplexChannel();
+            buffer.put((byte) channel.getChannel());
+            buffer.put((byte) channel.getPreambleIndex());
+            buffer.putShort((short) 12345); // Session ID, replace with actual session ID if available
+            buffer.put((byte) 1); // isController = true
+        } else if (sessionScope instanceof UwbControleeSessionScope) {
+            UwbControleeSessionScope controleeScope = (UwbControleeSessionScope) sessionScope;
+            buffer.put((byte) 0); // Channel (not known for controlee)
+            buffer.put((byte) 0); // Preamble index (not known for controlee)
+            buffer.putShort((short) 0); // Session ID (not known for controlee)
+            buffer.put((byte) 0); // isController = false
+        }
+
+        return buffer.array();
+    }
+
+    private void toggleBleAdvertising() {
+        if (isAdvertising) {
+            stopBleAdvertising();
+        } else {
+            startBleAdvertising();
+        }
+    }
     private void startBleAdvertising() {
         AdvertiseSettings settings = new AdvertiseSettings.Builder()
                 .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
                 .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-                .setConnectable(true)
+                .setConnectable(false)
                 .build();
 
         AdvertiseData data = new AdvertiseData.Builder()
                 .setIncludeDeviceName(true)
-                .addServiceUuid(new ParcelUuid(SERVICE_UUID))
+                .addServiceUuid(new ParcelUuid(UWB_SERVICE_UUID))
+                .addServiceData(new ParcelUuid(UWB_SERVICE_UUID), getUwbInfoBytes())
                 .build();
 
         bluetoothLeAdvertiser.startAdvertising(settings, data, advertiseCallback);
     }
 
+    private void updateBleAdvertising() {
+        if (bluetoothLeAdvertiser != null) {
+            bluetoothLeAdvertiser.stopAdvertising(advertiseCallback);
+            startBleAdvertising();
+        }
+    }
+
     private final AdvertiseCallback advertiseCallback = new AdvertiseCallback() {
         @Override
         public void onStartSuccess(AdvertiseSettings settingsInEffect) {
-            runOnUiThread(() -> Toast.makeText(MainActivity.this, "Advertising started", Toast.LENGTH_SHORT).show());
+            runOnUiThread(() -> {
+                isAdvertising = true;
+                toggleAdvertiseButton.setText("Stop Advertising");
+                Toast.makeText(MainActivity.this, "Advertising started with UWB info", Toast.LENGTH_SHORT).show();
+            });
         }
 
         @Override
         public void onStartFailure(int errorCode) {
-            runOnUiThread(() -> Toast.makeText(MainActivity.this, "Advertising failed to start", Toast.LENGTH_SHORT).show());
+            runOnUiThread(() -> {
+                isAdvertising = false;
+                toggleAdvertiseButton.setText("Start Advertising");
+                Toast.makeText(MainActivity.this, "Advertising failed to start", Toast.LENGTH_SHORT).show();
+            });
         }
     };
 
